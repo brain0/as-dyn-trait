@@ -1,0 +1,13 @@
+[package]
+name = "as-dyn-trait"
+version = "0.1.0"
+authors = ["Thomas Bächler <thomas.baechler@gmx.de>"]
+edition = "2018"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "1.0.16", features = ["full"] }
+quote = "1.0.3"
+proc-macro2 = "1.0.9"
