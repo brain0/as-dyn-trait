@@ -3,6 +3,14 @@ name = "as-dyn-trait"
 version = "0.1.0"
 authors = ["Thomas Bächler <thomas.baechler@gmx.de>"]
 edition = "2018"
+categories = ["rust-patterns"]
+description = "An attribute macro that generates methods for retrieving supertraits from trait-objects (upcasting)."
+repository = "https://github.com/brain0/as-dyn-trait"
+keywords = ["trait", "object", "upcast"]
+license = "Unlicense"
+
+[badges]
+maintenance = { status = "passively-maintained" }
 
 [lib]
 proc-macro = true
