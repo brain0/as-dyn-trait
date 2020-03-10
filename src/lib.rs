@@ -138,12 +138,12 @@ use syn::{
     TypeParamBound, Visibility, WhereClause,
 };
 
-fn make_trait_bound(ident: &Ident) -> TypeParamBound {
+fn make_trait_bound(path: Path) -> TypeParamBound {
     TypeParamBound::Trait(TraitBound {
         paren_token: None,
         modifier: TraitBoundModifier::None,
         lifetimes: None,
-        path: ident.clone().into(),
+        path,
     })
 }
 
@@ -245,7 +245,7 @@ fn make_trait(
     method_info: MethodInfo<'_>,
     mut_method_info: Option<MethodInfo<'_>>,
 ) -> TokenStream {
-    supertraits.push(make_trait_bound(&new_trait_name));
+    supertraits.push(make_trait_bound(parse_quote!(#new_trait_name)));
 
     let trait_doc = get_trait_doc(trait_doc_from, trait_doc_to);
 
