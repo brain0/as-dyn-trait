@@ -130,8 +130,13 @@ extern crate proc_macro;
 mod settings;
 
 use self::settings::{MacroOptions, Settings};
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::{parse_macro_input, Ident, ItemTrait, TraitBound, TraitBoundModifier, TypeParamBound};
+use syn::{
+    parse_macro_input, parse_quote, punctuated::Punctuated, FnArg, GenericParam, Generics, Ident,
+    ItemTrait, Lifetime, LifetimeDef, Path, Token, TraitBound, TraitBoundModifier, Type,
+    TypeParamBound, Visibility, WhereClause,
+};
 
 fn make_trait_bound(ident: &Ident) -> TypeParamBound {
     TypeParamBound::Trait(TraitBound {
@@ -156,26 +161,252 @@ pub fn as_dyn_trait(
     as_dyn_trait_impl(trait_item, settings).into()
 }
 
-fn get_trait_doc(from: impl AsRef<str>, to: impl AsRef<str>) -> String {
+fn get_trait_doc(from: &str, to: &str) -> String {
     format!(
         "Trait for converting {} to {}. This is mainly useful for upcasting trait objects.",
-        from.as_ref(),
-        to.as_ref()
+        from, to,
     )
 }
 
-fn get_method_doc(from: impl AsRef<str>, to: impl AsRef<str>) -> String {
+fn get_method_doc(from: &str, to: &str) -> String {
     format!(
         "Converts {} to {}. Internally, this only uses a type coercion.",
-        from.as_ref(),
-        to.as_ref()
+        from, to,
     )
 }
 
-fn as_dyn_trait_impl(
-    mut trait_item: ItemTrait,
-    settings: MacroOptions,
-) -> proc_macro2::TokenStream {
+struct MethodInfo<'a> {
+    name: &'a Ident,
+    doc_from: &'a str,
+    doc_to: &'a str,
+    lifetime_ident: Option<&'a Ident>,
+    self_param: FnArg,
+    return_type: Type,
+    where_clause: Option<WhereClause>,
+}
+
+impl<'a> MethodInfo<'a> {
+    fn build(self) -> (TokenStream, TokenStream) {
+        let MethodInfo {
+            name,
+            doc_from,
+            doc_to,
+            lifetime_ident,
+            self_param,
+            return_type,
+            where_clause,
+        } = self;
+
+        let doc = get_method_doc(doc_from, doc_to);
+        let lifetime_bound: Option<Generics> = lifetime_ident.map(|ident| {
+            let lifetime = GenericParam::Lifetime(LifetimeDef {
+                attrs: Vec::new(),
+                lifetime: Lifetime {
+                    apostrophe: Span::call_site(),
+                    ident: ident.clone(),
+                },
+                colon_token: None,
+                bounds: Default::default(),
+            });
+            parse_quote!(<#lifetime>)
+        });
+
+        (
+            quote! {
+                #[doc = #doc]
+                fn #name #lifetime_bound (#self_param) -> #return_type
+                    #where_clause;
+            },
+            quote! {
+                fn #name #lifetime_bound (#self_param) -> #return_type
+                    #where_clause
+                {
+                    self
+                }
+            },
+        )
+    }
+}
+
+fn split_option<A, B>(option: Option<(A, B)>) -> (Option<A>, Option<B>) {
+    match option {
+        Some((a, b)) => (Some(a), Some(b)),
+        None => (None, None),
+    }
+}
+
+fn make_trait(
+    trait_name: &Ident,
+    new_trait_name: &Ident,
+    vis: &Visibility,
+    supertraits: &mut Punctuated<TypeParamBound, Token![+]>,
+    trait_doc_from: &str,
+    trait_doc_to: &str,
+    method_info: MethodInfo<'_>,
+    mut_method_info: Option<MethodInfo<'_>>,
+) -> TokenStream {
+    supertraits.push(make_trait_bound(&new_trait_name));
+
+    let trait_doc = get_trait_doc(trait_doc_from, trait_doc_to);
+
+    let (method, method_impl) = method_info.build();
+    let (mut_method, mut_method_impl) = split_option(mut_method_info.map(|m| m.build()));
+
+    quote! {
+        #[doc = #trait_doc]
+        #vis trait #new_trait_name {
+            #method
+            #mut_method
+        }
+
+        impl<T: #trait_name + std::marker::Sized> #new_trait_name for T {
+            #method_impl
+            #mut_method_impl
+        }
+    }
+}
+
+struct MakeTraitOptions<'a> {
+    trait_name: &'a Ident,
+    vis: &'a Visibility,
+    supertraits: &'a mut Punctuated<TypeParamBound, Token![+]>,
+    method_name: &'a Ident,
+    mut_method_name: &'a Ident,
+}
+
+fn make_ref_trait(
+    options: &mut MakeTraitOptions<'_>,
+    new_trait_name: &Ident,
+    pinned: bool,
+) -> TokenStream {
+    let &mut MakeTraitOptions {
+        trait_name,
+        vis,
+        ref mut supertraits,
+        method_name,
+        mut_method_name,
+    } = options;
+
+    let (
+        doc_from,
+        doc_to,
+        self_param,
+        return_type,
+        doc_from_mut,
+        doc_to_mut,
+        self_param_mut,
+        return_type_mut,
+    ) = if pinned {
+        (
+            "`Pin<&Self>`",
+            format!("`Pin<&dyn {0}>`", trait_name),
+            parse_quote!(self: std::pin::Pin<&Self>),
+            parse_quote!(std::pin::Pin<&dyn #trait_name>),
+            "`Pin<&mut Self>`",
+            format!("`Pin<&mut dyn {0}>`", trait_name),
+            parse_quote!(self: std::pin::Pin<&mut Self>),
+            parse_quote!(std::pin::Pin<&mut dyn #trait_name>),
+        )
+    } else {
+        (
+            "`&Self`",
+            format!("`&dyn {0}`", trait_name),
+            parse_quote!(&self),
+            parse_quote!(&dyn #trait_name),
+            "`&mut Self`",
+            format!("`&mut dyn {0}`", trait_name),
+            parse_quote!(&mut self),
+            parse_quote!(&mut dyn #trait_name),
+        )
+    };
+    let trait_doc_from = format!("{} and {}", doc_from, doc_from_mut);
+    let trait_doc_to = format!("{} and {}", doc_to, doc_to_mut);
+
+    make_trait(
+        trait_name,
+        new_trait_name,
+        &vis,
+        supertraits,
+        &trait_doc_from,
+        &trait_doc_to,
+        MethodInfo {
+            name: method_name,
+            doc_from,
+            doc_to: &doc_to,
+            lifetime_ident: None,
+            self_param,
+            return_type,
+            where_clause: None,
+        },
+        Some(MethodInfo {
+            name: mut_method_name,
+            doc_from: doc_from_mut,
+            doc_to: &doc_to_mut,
+            lifetime_ident: None,
+            self_param: self_param_mut,
+            return_type: return_type_mut,
+            where_clause: None,
+        }),
+    )
+}
+
+fn make_smart_ptr_trait(
+    options: &mut MakeTraitOptions<'_>,
+    new_trait_name: &Ident,
+    smart_ptr: Path,
+    pinned: bool,
+) -> TokenStream {
+    let &mut MakeTraitOptions {
+        trait_name,
+        vis,
+        ref mut supertraits,
+        method_name,
+        mut_method_name: _,
+    } = options;
+
+    let smart_ptr_name = &smart_ptr.segments.last().as_ref().unwrap().ident;
+    let doc_from = if pinned {
+        format!("`Pin<{}<Self>>`", smart_ptr_name)
+    } else {
+        format!("`{}<Self>`", smart_ptr_name)
+    };
+    let doc_to = if pinned {
+        format!("`Pin<{}<dyn {}>>`", smart_ptr_name, trait_name)
+    } else {
+        format!("`{}<dyn {}>`", smart_ptr_name, trait_name)
+    };
+    let self_param = if pinned {
+        parse_quote!(self: std::pin::Pin<#smart_ptr<Self>>)
+    } else {
+        parse_quote!(self: #smart_ptr<Self>)
+    };
+    let return_type = if pinned {
+        parse_quote!(std::pin::Pin<#smart_ptr<dyn #trait_name + 'a>>)
+    } else {
+        parse_quote!(#smart_ptr<dyn #trait_name + 'a>)
+    };
+
+    make_trait(
+        trait_name,
+        new_trait_name,
+        vis,
+        supertraits,
+        &doc_from,
+        &doc_to,
+        MethodInfo {
+            name: method_name,
+            doc_from: &doc_from,
+            doc_to: &doc_to,
+            lifetime_ident: Some(&Ident::new("a", Span::call_site())),
+            self_param,
+            return_type,
+            where_clause: parse_quote!(where Self: 'a),
+        },
+        None,
+    )
+}
+
+fn as_dyn_trait_impl(mut trait_item: ItemTrait, settings: MacroOptions) -> TokenStream {
     let trait_name = &trait_item.ident;
 
     let settings = match Settings::read(trait_name, settings) {
@@ -183,267 +414,96 @@ fn as_dyn_trait_impl(
         Err(err) => return err.to_compile_error(),
     };
 
-    let vis = &trait_item.vis;
-    let method_name = settings.method_name();
-    let mut_method_name = settings.mut_method_name();
-
-    let supertraits = &mut trait_item.supertraits;
+    let mut options = MakeTraitOptions {
+        trait_name,
+        vis: &trait_item.vis,
+        supertraits: &mut trait_item.supertraits,
+        method_name: settings.method_name(),
+        mut_method_name: settings.mut_method_name(),
+    };
 
     let ref_trait = if settings.enable_ref() {
-        let ref_trait_name = settings.ref_trait_name();
-        supertraits.push(make_trait_bound(&ref_trait_name));
-
-        let trait_doc = get_trait_doc(
-            "`&Self` and `&mut Self`",
-            format!("`&dyn {0}` and `&mut dyn {0}`", trait_name),
-        );
-        let ref_method_doc = get_method_doc("`&Self`", format!("`&dyn {}`", trait_name));
-        let ref_mut_method_doc =
-            get_method_doc("`&mut Self`", format!("`&mut dyn {}`", trait_name));
-
-        Some(quote! {
-            #[doc = #trait_doc]
-            #vis trait #ref_trait_name {
-                #[doc = #ref_method_doc]
-                fn #method_name(&self) -> &dyn #trait_name;
-                #[doc = #ref_mut_method_doc]
-                fn #mut_method_name(&mut self) -> &mut dyn #trait_name;
-            }
-
-            impl<T: #trait_name + Sized> #ref_trait_name for T {
-                fn #method_name(&self) -> &dyn #trait_name {
-                    self
-                }
-
-                fn #mut_method_name(&mut self) -> &mut dyn #trait_name {
-                    self
-                }
-            }
-        })
+        Some(make_ref_trait(
+            &mut options,
+            &settings.ref_trait_name(),
+            false,
+        ))
     } else {
         None
     };
 
     let box_trait = if settings.enable_box() {
-        let box_trait_name = settings.box_trait_name();
-        supertraits.push(make_trait_bound(&box_trait_name));
-
-        let trait_doc = get_trait_doc("`Box<Self>`", format!("`Box<dyn {}>`", trait_name));
-        let method_doc = get_method_doc("`Box<Self>`", format!("`Box<dyn {}>`", trait_name));
-
-        Some(quote! {
-            #[doc = #trait_doc]
-            #vis trait #box_trait_name {
-                #[doc = #method_doc]
-                fn #method_name<'a>(self: std::boxed::Box<Self>) -> std::boxed::Box<dyn #trait_name + 'a>
-                where
-                    Self: 'a;
-            }
-
-            impl<T: #trait_name + Sized> #box_trait_name for T {
-                fn #method_name<'a>(self: std::boxed::Box<Self>) -> std::boxed::Box<dyn #trait_name + 'a>
-                where
-                    Self: 'a
-                {
-                    self
-                }
-            }
-        })
+        Some(make_smart_ptr_trait(
+            &mut options,
+            &settings.box_trait_name(),
+            parse_quote!(std::boxed::Box),
+            false,
+        ))
     } else {
         None
     };
 
     let rc_trait = if settings.enable_rc() {
-        let rc_trait_name = settings.rc_trait_name();
-        supertraits.push(make_trait_bound(&rc_trait_name));
-
-        let trait_doc = get_trait_doc("`Rc<Self>`", format!("`Rc<dyn {}>`", trait_name));
-        let method_doc = get_method_doc("`Rc<Self>`", format!("`Rc<dyn {}>`", trait_name));
-
-        Some(quote! {
-            #[doc = #trait_doc]
-            #vis trait #rc_trait_name {
-                #[doc = #method_doc]
-                fn #method_name<'a>(self: std::rc::Rc<Self>) -> std::rc::Rc<dyn #trait_name + 'a>
-                where
-                    Self: 'a;
-            }
-
-            impl<T: #trait_name + Sized> #rc_trait_name for T {
-                fn #method_name<'a>(self: std::rc::Rc<Self>) -> std::rc::Rc<dyn #trait_name + 'a>
-                where
-                    Self: 'a
-                {
-                    self
-                }
-            }
-        })
+        Some(make_smart_ptr_trait(
+            &mut options,
+            &settings.rc_trait_name(),
+            parse_quote!(std::rc::Rc),
+            false,
+        ))
     } else {
         None
     };
 
     let arc_trait = if settings.enable_arc() {
-        let arc_trait_name = settings.arc_trait_name();
-        supertraits.push(make_trait_bound(&arc_trait_name));
-
-        let trait_doc = get_trait_doc("`Arc<Self>`", format!("`Arc<dyn {}>`", trait_name));
-        let method_doc = get_method_doc("`Arc<Self>`", format!("`Arc<dyn {}>`", trait_name));
-
-        Some(quote! {
-            #[doc = #trait_doc]
-            #vis trait #arc_trait_name {
-                #[doc = #method_doc]
-                fn #method_name<'a>(self: std::sync::Arc<Self>) -> std::sync::Arc<dyn #trait_name + 'a>
-                where
-                    Self: 'a;
-            }
-
-            impl<T: #trait_name + Sized> #arc_trait_name for T {
-                fn #method_name<'a>(self: std::sync::Arc<Self>) -> std::sync::Arc<dyn #trait_name + 'a>
-                where
-                    Self: 'a
-                {
-                    self
-                }
-            }
-        })
+        Some(make_smart_ptr_trait(
+            &mut options,
+            &settings.arc_trait_name(),
+            parse_quote!(std::sync::Arc),
+            false,
+        ))
     } else {
         None
     };
 
     let pin_ref_trait = if settings.enable_pin() && settings.enable_ref() {
-        let pin_ref_trait_name = settings.pin_ref_trait_name();
-        supertraits.push(make_trait_bound(&pin_ref_trait_name));
-
-        let trait_doc = get_trait_doc(
-            "`Pin<&Self>` and `Pin<&mut Self>`",
-            format!("`Pin<&dyn {0}>` and `Pin<&mut dyn {0}>`", trait_name),
-        );
-        let ref_method_doc = get_method_doc("`Pin<&Self>`", format!("`Pin<&dyn {}>`", trait_name));
-        let ref_mut_method_doc = get_method_doc(
-            "`Pin<&mut Self>`",
-            format!("`Pin<&mut dyn {}>`", trait_name),
-        );
-
-        Some(quote! {
-            #[doc = #trait_doc]
-            #vis trait #pin_ref_trait_name {
-                #[doc = #ref_method_doc]
-                fn #method_name(self: core::pin::Pin<&Self>) -> core::pin::Pin<&dyn #trait_name>;
-                #[doc = #ref_mut_method_doc]
-                fn #mut_method_name(self: core::pin::Pin<&mut Self>) -> core::pin::Pin<&mut dyn #trait_name>;
-            }
-
-            impl<T: #trait_name + Sized> #pin_ref_trait_name for T {
-                fn #method_name(self: core::pin::Pin<&Self>) -> core::pin::Pin<&dyn #trait_name> {
-                    self
-                }
-
-                fn #mut_method_name(self: core::pin::Pin<&mut Self>) -> core::pin::Pin<&mut dyn #trait_name> {
-                    self
-                }
-            }
-        })
+        Some(make_ref_trait(
+            &mut options,
+            &settings.pin_ref_trait_name(),
+            true,
+        ))
     } else {
         None
     };
 
     let pin_box_trait = if settings.enable_pin() && settings.enable_box() {
-        let pin_box_trait_name = settings.pin_box_trait_name();
-        supertraits.push(make_trait_bound(&pin_box_trait_name));
-
-        let trait_doc = get_trait_doc(
-            "`Pin<Box<Self>>`",
-            format!("`Pin<Box<dyn {}>>`", trait_name),
-        );
-        let method_doc = get_method_doc(
-            "`Pin<Box<Self>>`",
-            format!("`Pin<Box<dyn {}>>`", trait_name),
-        );
-
-        Some(quote! {
-            #[doc = #trait_doc]
-            #vis trait #pin_box_trait_name {
-                #[doc = #method_doc]
-                fn #method_name<'a>(self: core::pin::Pin<std::boxed::Box<Self>>) -> core::pin::Pin<std::boxed::Box<dyn #trait_name + 'a>>
-                where
-                    Self: 'a;
-            }
-
-            impl<T: #trait_name + Sized> #pin_box_trait_name for T {
-                fn #method_name<'a>(self: core::pin::Pin<std::boxed::Box<Self>>) -> core::pin::Pin<std::boxed::Box<dyn #trait_name + 'a>>
-                where
-                    Self: 'a
-                {
-                    self
-                }
-            }
-        })
+        Some(make_smart_ptr_trait(
+            &mut options,
+            &settings.pin_box_trait_name(),
+            parse_quote!(std::boxed::Box),
+            true,
+        ))
     } else {
         None
     };
 
     let pin_rc_trait = if settings.enable_pin() && settings.enable_rc() {
-        let pin_rc_trait_name = settings.pin_rc_trait_name();
-        supertraits.push(make_trait_bound(&pin_rc_trait_name));
-
-        let trait_doc = get_trait_doc("`Pin<Rc<Self>>`", format!("`Pin<Rc<dyn {}>>`", trait_name));
-        let method_doc =
-            get_method_doc("`Pin<Rc<Self>>`", format!("`Pin<Rc<dyn {}>>`", trait_name));
-
-        Some(quote! {
-            #[doc = #trait_doc]
-            #vis trait #pin_rc_trait_name {
-                #[doc = #method_doc]
-                fn #method_name<'a>(self: core::pin::Pin<std::rc::Rc<Self>>) -> core::pin::Pin<std::rc::Rc<dyn #trait_name + 'a>>
-                where
-                    Self: 'a;
-            }
-
-            impl<T: #trait_name + Sized> #pin_rc_trait_name for T {
-                fn #method_name<'a>(self: core::pin::Pin<std::rc::Rc<Self>>) -> core::pin::Pin<std::rc::Rc<dyn #trait_name + 'a>>
-                where
-                    Self: 'a
-                {
-                    self
-                }
-            }
-        })
+        Some(make_smart_ptr_trait(
+            &mut options,
+            &settings.pin_rc_trait_name(),
+            parse_quote!(std::rc::Rc),
+            true,
+        ))
     } else {
         None
     };
 
     let pin_arc_trait = if settings.enable_pin() && settings.enable_arc() {
-        let pin_arc_trait_name = settings.pin_arc_trait_name();
-        supertraits.push(make_trait_bound(&pin_arc_trait_name));
-
-        let trait_doc = get_trait_doc(
-            "`Pin<Arc<Self>>`",
-            format!("`Pin<Arc<dyn {}>>`", trait_name),
-        );
-        let method_doc = get_method_doc(
-            "`Pin<Arc<Self>>`",
-            format!("`Pin<Arc<dyn {}>>`", trait_name),
-        );
-
-        Some(quote! {
-            #[doc = #trait_doc]
-            #vis trait #pin_arc_trait_name {
-                #[doc = #method_doc]
-                fn #method_name<'a>(self: core::pin::Pin<std::sync::Arc<Self>>) -> core::pin::Pin<std::sync::Arc<dyn #trait_name + 'a>>
-                where
-                    Self: 'a;
-            }
-
-            impl<T: #trait_name + Sized> #pin_arc_trait_name for T {
-                fn #method_name<'a>(self: core::pin::Pin<std::sync::Arc<Self>>) -> core::pin::Pin<std::sync::Arc<dyn #trait_name + 'a>>
-                where
-                    Self: 'a
-                {
-                    self
-                }
-            }
-        })
+        Some(make_smart_ptr_trait(
+            &mut options,
+            &settings.pin_arc_trait_name(),
+            parse_quote!(std::sync::Arc),
+            true,
+        ))
     } else {
         None
     };
