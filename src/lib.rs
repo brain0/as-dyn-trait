@@ -127,11 +127,16 @@
 
 extern crate proc_macro;
 
+mod generics;
 mod settings;
 
-use self::settings::{MacroOptions, Settings};
+use self::{
+    generics::GenericsExt,
+    settings::{MacroOptions, Settings},
+};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
+use std::collections::HashSet;
 use syn::{
     parse_macro_input, parse_quote, punctuated::Punctuated, FnArg, GenericParam, Generics, Ident,
     ItemTrait, Lifetime, LifetimeDef, Path, Token, TraitBound, TraitBoundModifier, Type,
@@ -145,20 +150,6 @@ fn make_trait_bound(path: Path) -> TypeParamBound {
         lifetimes: None,
         path,
     })
-}
-
-/// Generates methods for retrieving trait objects of supertraits from
-/// trait objects of subtraits.
-///
-/// See the [module-level documentation](index.html) for more details.
-#[proc_macro_attribute]
-pub fn as_dyn_trait(
-    args: proc_macro::TokenStream,
-    item: proc_macro::TokenStream,
-) -> proc_macro::TokenStream {
-    let trait_item = parse_macro_input!(item as ItemTrait);
-    let settings = parse_macro_input!(args as MacroOptions);
-    as_dyn_trait_impl(trait_item, settings).into()
 }
 
 fn get_trait_doc(from: &str, to: &str) -> String {
@@ -179,7 +170,7 @@ struct MethodInfo<'a> {
     name: &'a Ident,
     doc_from: &'a str,
     doc_to: &'a str,
-    lifetime_ident: Option<&'a Ident>,
+    lifetime: Option<&'a Lifetime>,
     self_param: FnArg,
     return_type: Type,
     where_clause: Option<WhereClause>,
@@ -191,20 +182,17 @@ impl<'a> MethodInfo<'a> {
             name,
             doc_from,
             doc_to,
-            lifetime_ident,
+            lifetime,
             self_param,
             return_type,
             where_clause,
         } = self;
 
         let doc = get_method_doc(doc_from, doc_to);
-        let lifetime_bound: Option<Generics> = lifetime_ident.map(|ident| {
+        let lifetime_bound: Option<Generics> = lifetime.map(|lifetime| {
             let lifetime = GenericParam::Lifetime(LifetimeDef {
                 attrs: Vec::new(),
-                lifetime: Lifetime {
-                    apostrophe: Span::call_site(),
-                    ident: ident.clone(),
-                },
+                lifetime: lifetime.clone(),
                 colon_token: None,
                 bounds: Default::default(),
             });
@@ -236,8 +224,11 @@ fn split_option<A, B>(option: Option<(A, B)>) -> (Option<A>, Option<B>) {
 }
 
 fn make_trait(
-    trait_name: &Ident,
+    generics: &Generics,
+    generics_extended: &Generics,
+    generics_without_bounds: &Generics,
     new_trait_name: &Ident,
+    type_param: &Ident,
     vis: &Visibility,
     supertraits: &mut Punctuated<TypeParamBound, Token![+]>,
     trait_doc_from: &str,
@@ -245,21 +236,28 @@ fn make_trait(
     method_info: MethodInfo<'_>,
     mut_method_info: Option<MethodInfo<'_>>,
 ) -> TokenStream {
-    supertraits.push(make_trait_bound(parse_quote!(#new_trait_name)));
+    supertraits.push(make_trait_bound(
+        parse_quote!(#new_trait_name #generics_without_bounds),
+    ));
 
     let trait_doc = get_trait_doc(trait_doc_from, trait_doc_to);
 
     let (method, method_impl) = method_info.build();
     let (mut_method, mut_method_impl) = split_option(mut_method_info.map(|m| m.build()));
+    let where_clause = &generics.where_clause;
 
     quote! {
         #[doc = #trait_doc]
-        #vis trait #new_trait_name {
+        #vis trait #new_trait_name #generics
+            #where_clause
+        {
             #method
             #mut_method
         }
 
-        impl<T: #trait_name + std::marker::Sized> #new_trait_name for T {
+        impl #generics_extended #new_trait_name #generics_without_bounds for #type_param
+            #where_clause
+        {
             #method_impl
             #mut_method_impl
         }
@@ -268,10 +266,15 @@ fn make_trait(
 
 struct MakeTraitOptions<'a> {
     trait_name: &'a Ident,
+    generics: Generics,
+    generics_extended: Generics,
+    generics_without_bounds: Generics,
+    type_param: Ident,
     vis: &'a Visibility,
     supertraits: &'a mut Punctuated<TypeParamBound, Token![+]>,
     method_name: &'a Ident,
     mut_method_name: &'a Ident,
+    method_lifetime: Lifetime,
 }
 
 fn make_ref_trait(
@@ -281,10 +284,15 @@ fn make_ref_trait(
 ) -> TokenStream {
     let &mut MakeTraitOptions {
         trait_name,
+        ref generics,
+        ref generics_extended,
+        ref generics_without_bounds,
+        ref type_param,
         vis,
         ref mut supertraits,
         method_name,
         mut_method_name,
+        method_lifetime: _,
     } = options;
 
     let (
@@ -301,30 +309,33 @@ fn make_ref_trait(
             "`Pin<&Self>`",
             format!("`Pin<&dyn {0}>`", trait_name),
             parse_quote!(self: std::pin::Pin<&Self>),
-            parse_quote!(std::pin::Pin<&dyn #trait_name>),
+            parse_quote!(std::pin::Pin<&dyn #trait_name #generics_without_bounds>),
             "`Pin<&mut Self>`",
             format!("`Pin<&mut dyn {0}>`", trait_name),
             parse_quote!(self: std::pin::Pin<&mut Self>),
-            parse_quote!(std::pin::Pin<&mut dyn #trait_name>),
+            parse_quote!(std::pin::Pin<&mut dyn #trait_name #generics_without_bounds>),
         )
     } else {
         (
             "`&Self`",
             format!("`&dyn {0}`", trait_name),
             parse_quote!(&self),
-            parse_quote!(&dyn #trait_name),
+            parse_quote!(&dyn #trait_name #generics_without_bounds),
             "`&mut Self`",
             format!("`&mut dyn {0}`", trait_name),
             parse_quote!(&mut self),
-            parse_quote!(&mut dyn #trait_name),
+            parse_quote!(&mut dyn #trait_name #generics_without_bounds),
         )
     };
     let trait_doc_from = format!("{} and {}", doc_from, doc_from_mut);
     let trait_doc_to = format!("{} and {}", doc_to, doc_to_mut);
 
     make_trait(
-        trait_name,
+        generics,
+        generics_extended,
+        generics_without_bounds,
         new_trait_name,
+        type_param,
         &vis,
         supertraits,
         &trait_doc_from,
@@ -333,7 +344,7 @@ fn make_ref_trait(
             name: method_name,
             doc_from,
             doc_to: &doc_to,
-            lifetime_ident: None,
+            lifetime: None,
             self_param,
             return_type,
             where_clause: None,
@@ -342,7 +353,7 @@ fn make_ref_trait(
             name: mut_method_name,
             doc_from: doc_from_mut,
             doc_to: &doc_to_mut,
-            lifetime_ident: None,
+            lifetime: None,
             self_param: self_param_mut,
             return_type: return_type_mut,
             where_clause: None,
@@ -358,37 +369,40 @@ fn make_smart_ptr_trait(
 ) -> TokenStream {
     let &mut MakeTraitOptions {
         trait_name,
+        ref generics,
+        ref generics_extended,
+        ref generics_without_bounds,
+        ref type_param,
         vis,
         ref mut supertraits,
         method_name,
         mut_method_name: _,
+        ref method_lifetime,
     } = options;
 
     let smart_ptr_name = &smart_ptr.segments.last().as_ref().unwrap().ident;
-    let doc_from = if pinned {
-        format!("`Pin<{}<Self>>`", smart_ptr_name)
+    let (doc_from, doc_to, self_param, return_type) = if pinned {
+        (
+            format!("`Pin<{}<Self>>`", smart_ptr_name),
+            format!("`Pin<{}<dyn {}>>`", smart_ptr_name, trait_name),
+            parse_quote!(self: std::pin::Pin<#smart_ptr<Self>>),
+            parse_quote!(std::pin::Pin<#smart_ptr<dyn #trait_name #generics_without_bounds + #method_lifetime>>),
+        )
     } else {
-        format!("`{}<Self>`", smart_ptr_name)
-    };
-    let doc_to = if pinned {
-        format!("`Pin<{}<dyn {}>>`", smart_ptr_name, trait_name)
-    } else {
-        format!("`{}<dyn {}>`", smart_ptr_name, trait_name)
-    };
-    let self_param = if pinned {
-        parse_quote!(self: std::pin::Pin<#smart_ptr<Self>>)
-    } else {
-        parse_quote!(self: #smart_ptr<Self>)
-    };
-    let return_type = if pinned {
-        parse_quote!(std::pin::Pin<#smart_ptr<dyn #trait_name + 'a>>)
-    } else {
-        parse_quote!(#smart_ptr<dyn #trait_name + 'a>)
+        (
+            format!("`{}<Self>`", smart_ptr_name),
+            format!("`{}<dyn {}>`", smart_ptr_name, trait_name),
+            parse_quote!(self: #smart_ptr<Self>),
+            parse_quote!(#smart_ptr<dyn #trait_name #generics_without_bounds + #method_lifetime>),
+        )
     };
 
     make_trait(
-        trait_name,
+        generics,
+        generics_extended,
+        generics_without_bounds,
         new_trait_name,
+        type_param,
         vis,
         supertraits,
         &doc_from,
@@ -397,17 +411,102 @@ fn make_smart_ptr_trait(
             name: method_name,
             doc_from: &doc_from,
             doc_to: &doc_to,
-            lifetime_ident: Some(&Ident::new("a", Span::call_site())),
+            lifetime: Some(method_lifetime),
             self_param,
             return_type,
-            where_clause: parse_quote!(where Self: 'a),
+            where_clause: parse_quote!(where Self: #method_lifetime),
         },
         None,
     )
 }
 
+fn extend_generics(
+    generics: &Generics,
+    generics_without_bounds: &Generics,
+    trait_name: &Ident,
+    type_param: &Ident,
+) -> Generics {
+    let lt_token = Some(generics.lt_token.clone().unwrap_or_default());
+    let mut params = generics.params.clone();
+    let gt_token = Some(generics.gt_token.clone().unwrap_or_default());
+    // We only use the where clause from the original generics object, no need to clone it here.
+    let where_clause = None;
+
+    params.push(GenericParam::Type(
+        parse_quote!(#type_param: #trait_name #generics_without_bounds + std::marker::Sized),
+    ));
+
+    Generics {
+        lt_token,
+        params,
+        gt_token,
+        where_clause,
+    }
+}
+
+fn find_unused_type_param(generics: &Generics) -> Ident {
+    let params: HashSet<_> = generics
+        .type_params()
+        .map(|p| p.ident.to_string())
+        .collect();
+
+    for candidate in (b'T'..=b'Z').chain(b'A'..b'T') {
+        let candidate_slice = &[candidate];
+        let candidate = std::str::from_utf8(candidate_slice).unwrap();
+
+        if !params.contains(candidate) {
+            return Ident::new(candidate, Span::call_site());
+        }
+    }
+
+    panic!("Unable to find an unused type parameter. Please report a bug.");
+}
+
+fn find_unused_lifetime(generics: &Generics) -> Lifetime {
+    let lifetimes: HashSet<_> = generics
+        .lifetimes()
+        .map(|l| l.lifetime.ident.to_string())
+        .collect();
+
+    for candidate in b'a'..=b'z' {
+        let candidate_slice = &[candidate];
+        let candidate = std::str::from_utf8(candidate_slice).unwrap();
+
+        if !lifetimes.contains(candidate) {
+            return Lifetime {
+                apostrophe: Span::call_site(),
+                ident: Ident::new(candidate, Span::call_site()),
+            };
+        }
+    }
+
+    panic!("Unable to find an unused lifetime. Please report a bug.");
+}
+
+/// Generates methods for retrieving trait objects of supertraits from
+/// trait objects of subtraits.
+///
+/// See the [module-level documentation](index.html) for more details.
+#[proc_macro_attribute]
+pub fn as_dyn_trait(
+    args: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let trait_item = parse_macro_input!(item as ItemTrait);
+    let settings = parse_macro_input!(args as MacroOptions);
+    as_dyn_trait_impl(trait_item, settings).into()
+}
+
 fn as_dyn_trait_impl(mut trait_item: ItemTrait, settings: MacroOptions) -> TokenStream {
     let trait_name = &trait_item.ident;
+    let generics = trait_item.generics.clone().remove_defaults();
+    let generics_without_bounds = generics.clone().remove_bounds();
+
+    let type_param = find_unused_type_param(&generics);
+    let method_lifetime = find_unused_lifetime(&generics);
+
+    let generics_extended =
+        extend_generics(&generics, &generics_without_bounds, trait_name, &type_param);
 
     let settings = match Settings::read(trait_name, settings) {
         Ok(settings) => settings,
@@ -416,10 +515,15 @@ fn as_dyn_trait_impl(mut trait_item: ItemTrait, settings: MacroOptions) -> Token
 
     let mut options = MakeTraitOptions {
         trait_name,
+        generics,
+        generics_extended,
+        generics_without_bounds,
+        type_param,
         vis: &trait_item.vis,
         supertraits: &mut trait_item.supertraits,
         method_name: settings.method_name(),
         mut_method_name: settings.mut_method_name(),
+        method_lifetime,
     };
 
     let ref_trait = if settings.enable_ref() {
