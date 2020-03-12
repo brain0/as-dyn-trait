@@ -87,7 +87,8 @@
 //!     * `fn as_dyn_my_trait(self: Pin<Arc<Self>>) -> Pin<Arc<dyn MyTrait>>;`
 //!
 //! These traits are automatically implemented for all `Sized` types that implement `MyTrait`. If you
-//! want to implement `MyTrait` for dynamically sized types, you need to do so manually.
+//! want to implement `MyTrait` for dynamically sized types, you need to do add these implementations manually.
+//! Since you cannot turn a DST into a trait object, such an implementation must always panic.
 //!
 //! In order for those traits to work on trait objects, all of them are automatically supertraits of `MyTrait`.
 //!
